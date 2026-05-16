@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="referrer" content="no-referrer">
+    <meta name="theme-color" content="#05010a">
+    <title>Nebula Stream Player</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        nebula: {
+                            900: '#05010a',
+                            800: '#110420',
+                            700: '#230942',
+                            600: '#4a148c',
+                            500: '#7e22ce',
+                            400: '#a855f7',
+                            300: '#d8b4fe'
+                        }
+                    },
+                    animation: {
+                        'pulse-fast': 'pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #05010a;
+            color: #e2e8f0;
+            -webkit-tap-highlight-color: transparent;
+            overflow-x: hidden;
+        }
+
+        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .hide-scrollbar::-webkit-scrollbar { display: none; }
+
+        .hero-gradient { background: linear-gradient(to top, #05010a 0%, rgba(5,1,10,0.8) 30%, transparent 80%); }
+        .modal-gradient { background: linear-gradient(to top, #110420 0%, #110420 70%, transparent 100%); }
+        .card-gradient { background: linear-gradient(145deg, #110420 0%, #05010a 100%); }
+
+        img { transition: opacity 0.3s ease-in-out; }
+        
+        /* Custom Range Slider for Volume/Progress */
+        input[type=range] {
+            -webkit-appearance: none;
+            background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 12px;
+            width: 12px;
+            border-radius: 50%;
+            background: #a855f7;
+            cursor: pointer;
+            margin-top: -4px;
+            box-shadow: 0 0 10px #a855f7;
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: #230942;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useEffect, useMemo, useRef, useCallback } from 'https://esm.sh/react@18.2.0';
+        import { createRoot } from 'https://esm.sh/react-dom@18.2.0/client';
+        import { Play, Search, Film, Tv, Settings, Heart, History, Trash2, X, Server, ChevronDown, PlayCircle, AlertCircle, Globe, Star, Cast, Info, Plus, Check, MonitorPlay, Home, Copy, CheckCheck, ArrowLeft, ExternalLink, KeySquare, Database, User, ListPlus, BarChart2, CheckCircle2, Circle, Share2, Clock, PieChart, Sparkles, Bell, Filter, Download, DownloadCloud, WifiOff, Zap, ShieldCheck } from 'https://esm.sh/lucide-react@0.292.0';
+
+        // --- Core Configurations ---
+        const SERVERS = [
+            { id: 'streamimdb', name: 'StreamIMDb', type: 'external', getUrl: (t, tmdb, imdb, s, e) => `https://streamimdb.me/embed/${t}/${imdb || tmdb}${t==='tv'&&s&&e?`/${s}/${e}`:''}` },
+            { id: 'vaplayer', name: 'VAPlayer', type: 'external', getUrl: (t, tmdb, imdb, s, e) => `https://vaplayer.ru/embed/${t}/${imdb || tmdb}${t==='tv'&&s&&e?`?s=${s}&e=${e}`:''}` },
+            { id: 'vidsrc', name: 'VidSrc API', type: 'external', getUrl: (t, tmdb, imdb, s, e) => `https://vidsrc.me/embed/${t}?tmdb=${tmdb}${t==='tv'&&s&&e?`&season=${s}&episode=${e}`:''}` },
+            { id: 'autoembed', name: 'AutoEmbed', type: 'external', getUrl: (t, tmdb, imdb, s, e) => `https://autoembed.to/${t}/tmdb/${tmdb}${t==='tv'&&s&&e?`-${s}-${e}`:''}` },
+            { id: 'vidsrcpro', name: 'VidSrc Pro', type: 'external', getUrl: (t, tmdb, imdb, s, e) => `https://vidsrc.cc/v2/embed/${t}/${tmdb}${t==='tv'&&s&&e?`/${s}/${e}`:''}` },
+            { id: 'iptv', name: 'Encrypted IPTV Vault', type: 'internal', getUrl: () => '' }
+        ];
+
+        // --- Local-First DB Manager (IndexedDB Wrapper) ---
+        const LocalDB = {
+            dbName: 'NebulaLocalDB',
+            version: 1,
+            init: () => {
+                return new Promise((resolve, reject) => {
+                    const req = indexedDB.open(LocalDB.dbName, LocalDB.version);
+                    req.onupgradeneeded = (e) => {
+                        const db = e.target.result;
+                        if (!db.objectStoreNames.contains('downloads')) {
+                            db.createObjectStore('downloads', { keyPath: 'id' });
+                        }
+                    };
+                    req.onsuccess = () => resolve(req.result);
+                    req.onerror = () => reject(req.error);
+                });
+            },
+            saveDownload: async (media) => {
+                const db = await LocalDB.init();
+                return new Promise((resolve) => {
+                    const tx = db.transaction('downloads', 'readwrite');
+                    tx.objectStore('downloads').put({ ...media, downloadedAt: Date.now() });
+                    tx.oncomplete = () => resolve(true);
+                });
+            },
+            getDownloads: async () => {
+                const db = await LocalDB.init();
+                return new Promise((resolve) => {
+                    const tx = db.transaction('downloads', 'readonly');
+                    const req = tx.objectStore('downloads').getAll();
+                    req.onsuccess = () => resolve(req.result);
+                });
+            },
+            removeDownload: async (id) => {
+                const db = await LocalDB.init();
+                return new Promise((resolve) => {
+                    const tx = db.transaction('downloads', 'readwrite');
+                    tx.objectStore('downloads').delete(id);
+                    tx.oncomplete = () => resolve(true);
+                });
+            }
+        };
+
+        const AppContext = React.createContext(null);
+
+        const LoadingSpinner = () => (
+            <div className="flex justify-center items-center py-10">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-nebula-400 shadow-[0_0_15px_rgba(168,85,247,0.5)]"></div>
+            </div>
+        );
+
+        // --- Shared UI Components ---
+        const MediaRow = ({ title, url, items, onSeeAll }) => {
+            const { tmdbKey, openDetails, isOffline } = React.useContext(AppContext);
+            const [rowItems, setRowItems] = useState(items || []);
+            const [loading, setLoading] = useState(!items);
+
+            useEffect(() => {
+                if (url && !items && !isOffline) {
+                    fetch(`https://api.themoviedb.org/3${url}${url.includes('?') ? '&' : '?'}api_key=${tmdbKey}`)
+                        .then(res => res.json()).then(data => {
+                            setRowItems((data.results || []).filter(i => i.poster_path && !i.known_for));
+                            setLoading(false);
+                        }).catch(() => setLoading(false));
+                } else if (isOffline) {
+                    setLoading(false);
+                }
+            }, [url, tmdbKey, items, isOffline]);
+
+            if (!loading && rowItems.length === 0) return null;
+
+            return (
+                <div className="mb-8">
+                    <div className="flex justify-between items-end px-4 sm:px-8 mb-3">
+                        <h2 className="text-lg font-extrabold text-white tracking-wide flex items-center gap-2">
+                            {title === 'Recommended for You' && <Sparkles size={18} className="text-nebula-400" />}
+                            {title}
+                        </h2>
+                        {onSeeAll && !isOffline && <span onClick={() => onSeeAll({title, url: url || items})} className="text-xs text-nebula-400 font-bold cursor-pointer hover:text-nebula-300 transition-colors uppercase tracking-wider">See All</span>}
+                    </div>
+                    <div className="flex overflow-x-auto gap-4 px-4 sm:px-8 pb-4 hide-scrollbar snap-x">
+                        {loading ? <div className="w-full flex gap-4">{[1,2,3,4,5,6].map(i => <div key={i} className="w-32 h-48 bg-nebula-800 rounded-xl flex-shrink-0 animate-pulse border border-nebula-700"></div>)}</div> : 
+                            rowItems.map(item => (
+                                <div key={item.id} onClick={() => openDetails(item)} className="w-32 flex-shrink-0 cursor-pointer snap-start transition-all duration-300 hover:scale-105 hover:-translate-y-2 group relative rounded-xl">
+                                    <img src={item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : item.Poster} alt={item.title || item.name} className="w-full h-48 object-cover rounded-xl shadow-[0_4px_20px_rgba(0,0,0,0.5)] group-hover:shadow-[0_8px_30px_rgba(126,34,206,0.3)] border border-nebula-800/50" loading="lazy" />
+                                    <div className="absolute top-2 right-2 bg-nebula-900/80 text-white text-[10px] font-bold px-2 py-1 rounded flex items-center gap-1 backdrop-blur-md border border-nebula-700/50">
+                                        <Star size={10} className="fill-nebula-400 text-nebula-400" /> {item.vote_average ? item.vote_average.toFixed(1) : 'NR'}
+                                    </div>
+                                </div>
+                            ))
+                        }
+                    </div>
+                </div>
+            );
+        };
+
+        const HeroBanner = ({ endpoint }) => {
+            const { tmdbKey, openDetails, isOffline } = React.useContext(AppContext);
+            const [heroItem, setHeroItem] = useState(null);
+            
+            useEffect(() => {
+                if (isOffline) return;
+                fetch(`https://api.themoviedb.org/3${endpoint}?api_key=${tmdbKey}`)
+                    .then(res => res.json()).then(data => {
+                        const validList = (data.results || []).filter(i => i.backdrop_path && i.overview);
+                        setHeroItem(validList[Math.floor(Math.random() * Math.min(5, validList.length))] || validList[0]);
+                    });
+            }, [endpoint, tmdbKey, isOffline]);
+
+            if (isOffline) return <div className="h-[50vh] w-full flex items-center justify-center bg-nebula-900 border-b border-nebula-800"><WifiOff size={48} className="text-nebula-600 mb-4"/><h2 className="text-xl font-bold text-nebula-400">Offline Mode Active</h2></div>;
+            if (!heroItem) return <div className="h-[75vh] w-full bg-nebula-900 animate-pulse"></div>;
+
+            return (
+                <div className="relative w-full h-[75vh] flex flex-col justify-end pb-16">
+                    <div className="absolute inset-0 z-0">
+                        <img src={`https://image.tmdb.org/t/p/original${heroItem.backdrop_path}`} className="w-full h-full object-cover" />
+                        <div className="absolute inset-0 hero-gradient"></div>
+                    </div>
+                    <div className="relative z-10 px-6 sm:px-12 flex flex-col items-start max-w-3xl space-y-4">
+                        <div className="bg-nebula-600/20 border border-nebula-500/30 backdrop-blur-md px-3 py-1 rounded-full text-xs font-bold text-nebula-300 flex items-center gap-2 w-max">
+                            <Zap size={12} className="text-nebula-400" /> Featured Title
+                        </div>
+                        <h1 className="text-4xl sm:text-6xl font-extrabold text-white drop-shadow-[0_5px_5px_rgba(0,0,0,0.8)] leading-tight">{heroItem.title || heroItem.name}</h1>
+                        <p className="text-sm sm:text-base text-gray-300 line-clamp-3 max-w-2xl drop-shadow-md">{heroItem.overview}</p>
+                        <div className="flex items-center gap-4 pt-2">
+                            <button onClick={() => openDetails(heroItem)} className="flex items-center justify-center gap-2 bg-nebula-500 text-white px-8 py-3 rounded-lg font-bold hover:bg-nebula-400 transition-all shadow-[0_0_20px_rgba(126,34,206,0.4)] hover:shadow-[0_0_30px_rgba(168,85,247,0.6)]">
+                                <Play size={20} className="fill-white" /> Watch Now
+                            </button>
+                            <button onClick={() => openDetails(heroItem)} className="flex items-center justify-center gap-2 bg-nebula-900/50 border border-nebula-600 text-white px-6 py-3 rounded-lg font-bold hover:bg-nebula-800 transition-all backdrop-blur-md">
+                                <Info size={20} /> Details
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const DetailsModal = ({ media, onClose }) => {
+            const { tmdbKey, launchPlayer, isOffline, downloadMedia } = React.useContext(AppContext);
+            const [details, setDetails] = useState(null);
+            const [isDownloading, setIsDownloading] = useState(false);
+            const [downloadProgress, setDownloadProgress] = useState(0);
+
+            const type = media.media_type || media.Type || (media.name ? 'tv' : 'movie');
+
+            useEffect(() => {
+                if (isOffline) { setDetails(media); return; }
+                fetch(`https://api.themoviedb.org/3/${type}/${media.id}?api_key=${tmdbKey}&append_to_response=external_ids`)
+                    .then(res => res.json()).then(data => setDetails(data));
+            }, [media, isOffline]);
+
+            if (!details) return <div className="fixed inset-0 z-[60] bg-nebula-900/90 backdrop-blur-sm flex items-center justify-center"><LoadingSpinner/></div>;
+
+            const handleDownload = () => {
+                setIsDownloading(true);
+                // Simulate download process for local-first architecture
+                let progress = 0;
+                const interval = setInterval(() => {
+                    progress += Math.random() * 15;
+                    if (progress >= 100) {
+                        clearInterval(interval);
+                        setDownloadProgress(100);
+                        downloadMedia({
+                            id: details.id, Title: details.title || details.name, Type: type,
+                            Poster: details.poster_path ? `https://image.tmdb.org/t/p/w500${details.poster_path}` : details.Poster,
+                            backdrop: details.backdrop_path ? `https://image.tmdb.org/t/p/w780${details.backdrop_path}` : details.backdrop,
+                            overview: details.overview,
+                            runtime: details.runtime || 120
+                        });
+                        setTimeout(() => setIsDownloading(false), 1000);
+                    } else {
+                        setDownloadProgress(progress);
+                    }
+                }, 300);
+            };
+
+            return (
+                <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center bg-black/80 backdrop-blur-sm sm:p-4 animate-in fade-in" onClick={onClose}>
+                    <div className="bg-nebula-900 border border-nebula-700 w-full sm:max-w-3xl sm:rounded-2xl h-[85vh] sm:h-auto sm:max-h-[90vh] overflow-y-auto hide-scrollbar relative shadow-[0_0_50px_rgba(74,20,140,0.3)]" onClick={e => e.stopPropagation()}>
+                        <button onClick={onClose} className="absolute top-4 right-4 z-20 bg-nebula-800/80 p-2 rounded-full text-white hover:bg-nebula-700 transition-colors border border-nebula-600"><X size={20} /></button>
+                        
+                        <div className="relative w-full aspect-video sm:aspect-[21/9] bg-nebula-950">
+                            <img src={`https://image.tmdb.org/t/p/w780${details.backdrop_path || details.poster_path || details.backdrop}`} className="w-full h-full object-cover opacity-60"/>
+                            <div className="absolute inset-0 modal-gradient flex items-end p-6 sm:p-8">
+                                <h2 className="text-3xl sm:text-4xl font-extrabold text-white drop-shadow-lg">{details.title || details.name || details.Title}</h2>
+                            </div>
+                        </div>
+
+                        <div className="p-6 sm:p-8 space-y-6">
+                            <div className="flex flex-wrap items-center gap-3 text-sm text-nebula-200 font-medium">
+                                <span className="flex items-center gap-1 text-nebula-400 bg-nebula-800 px-2 py-1 rounded-md border border-nebula-700"><Star size={14} className="fill-nebula-400"/> {details.vote_average ? details.vote_average.toFixed(1) : 'NR'}</span>
+                                <span>{(details.release_date || details.first_air_date || '').substring(0,4)}</span>
+                                <span className="border border-nebula-600 px-2 py-0.5 rounded text-[10px] uppercase text-nebula-300">HD</span>
+                                {type === 'movie' && details.runtime && <span>{Math.floor(details.runtime/60)}h {details.runtime%60}m</span>}
+                            </div>
+
+                            <div className="flex flex-col sm:flex-row gap-4">
+                                <button onClick={() => launchPlayer(details, type === 'tv' ? 1 : null, type === 'tv' ? 1 : null, details)} className="flex-1 flex items-center justify-center gap-2 bg-nebula-500 text-white py-3 rounded-xl font-bold hover:bg-nebula-400 transition-all shadow-[0_0_15px_rgba(126,34,206,0.4)]">
+                                    <Play size={20} className="fill-white" /> Play {type === 'movie' ? 'Movie' : 'S1 E1'}
+                                </button>
+                                
+                                <button onClick={handleDownload} disabled={isDownloading || downloadProgress === 100} className="flex-1 flex items-center justify-center gap-2 bg-nebula-800 border border-nebula-600 text-white py-3 rounded-xl font-bold hover:bg-nebula-700 transition-all relative overflow-hidden disabled:opacity-80 disabled:cursor-not-allowed">
+                                    {isDownloading ? (
+                                        <>
+                                            <div className="absolute left-0 top-0 bottom-0 bg-nebula-600/30 transition-all duration-300" style={{width: `${downloadProgress}%`}}></div>
+                                            <span className="relative z-10 text-nebula-300 text-sm">Caching Data... {Math.round(downloadProgress)}%</span>
+                                        </>
+                                    ) : downloadProgress === 100 ? (
+                                        <><ShieldCheck size={20} className="text-green-400"/> Saved Offline</>
+                                    ) : (
+                                        <><DownloadCloud size={20} /> Download</>
+                                    )}
+                                </button>
+                            </div>
+
+                            <p className="text-sm text-nebula-100 leading-relaxed opacity-90">{details.overview || 'No overview available for this title.'}</p>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const PlayerOverlay = () => {
+            const { activePlayerMedia, setActivePlayerMedia } = React.useContext(AppContext);
+            const [activeServerId, setActiveServerId] = useState(SERVERS[0].id);
+            const [iptvStreamId, setIptvStreamId] = useState('');
+            const videoRef = useRef(null);
+
+            // Hardcoded IPTV Credentials
+            const IPTV_DOMAIN = 'http://hydraa.st:80';
+            const IPTV_USER = 'haithemb';
+            const IPTV_PASS = 'kse8328b';
+
+            if (!activePlayerMedia) return null;
+
+            const activeServer = SERVERS.find(s => s.id === activeServerId) || SERVERS[0];
+            const isIptv = activeServer.id === 'iptv';
+            let finalUrl = activeServer.getUrl(activePlayerMedia.type, activePlayerMedia.tmdbId, activePlayerMedia.imdbId, activePlayerMedia.season, activePlayerMedia.episode);
+
+            if (isIptv && iptvStreamId) {
+                const cleanDomain = IPTV_DOMAIN.replace(/\/$/, '');
+                const typePath = activePlayerMedia.type === 'tv' ? 'series' : 'movie';
+                let streamPath = String(iptvStreamId);
+                if (!streamPath.includes('.')) streamPath += '.mp4';
+                finalUrl = `${cleanDomain}/${typePath}/${IPTV_USER}/${IPTV_PASS}/${streamPath}`;
+            }
+
+            return (
+                <div className="fixed inset-0 z-[100] bg-nebula-950 flex flex-col animate-in fade-in">
+                    {/* Header Nav */}
+                    <div className="flex items-center justify-between p-4 sm:p-6 bg-gradient-to-b from-black/90 to-transparent absolute top-0 left-0 right-0 z-30">
+                        <div className="flex items-center gap-4">
+                            <button onClick={() => setActivePlayerMedia(null)} className="text-white hover:text-nebula-300 bg-nebula-800/50 p-2 rounded-full backdrop-blur-sm transition-all"><ArrowLeft size={24}/></button>
+                            <div>
+                                <span className="font-bold text-white text-lg block line-clamp-1">{activePlayerMedia.title}</span>
+                                {activePlayerMedia.type === 'tv' && <span className="text-xs font-bold text-nebula-400 tracking-wider uppercase">Season {activePlayerMedia.season} Episode {activePlayerMedia.episode}</span>}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Main Content Area */}
+                    <div className="flex-grow flex flex-col items-center justify-center w-full max-w-6xl mx-auto mt-20 px-4 pb-4">
+                        <div className="w-full flex flex-col gap-4 h-full max-h-[80vh]">
+                            <div className="w-full flex-grow bg-black rounded-xl overflow-hidden shadow-[0_10px_40px_rgba(0,0,0,0.8)] border border-nebula-800 relative">
+                                {isIptv && !iptvStreamId ? (
+                                    <div className="absolute inset-0 flex flex-col items-center justify-center p-6 bg-nebula-900 text-center z-20">
+                                        <ShieldCheck size={48} className="text-nebula-500 mb-4" />
+                                        <h3 className="text-xl font-bold text-white mb-2">Encrypted IPTV Vault</h3>
+                                        <p className="text-sm text-nebula-300 max-w-md mb-6">Enter the numerical Stream ID for this media from your provider.</p>
+                                        <input type="text" placeholder="Stream ID" value={iptvStreamId} onChange={e => setIptvStreamId(e.target.value)} className="bg-nebula-950 border border-nebula-700 rounded-lg px-4 py-3 text-white outline-none focus:border-nebula-400 text-center font-mono w-64 shadow-inner" />
+                                    </div>
+                                ) : isIptv ? (
+                                    <video ref={videoRef} src={finalUrl} className="w-full h-full" controls autoPlay playsInline />
+                                ) : (
+                                    <iframe src={finalUrl} className="w-full h-full border-0" allowFullScreen allow="autoplay; fullscreen" sandbox="allow-scripts allow-same-origin allow-presentation"></iframe>
+                                )}
+                            </div>
+
+                            {/* Server Selection Bar */}
+                            <div className="w-full bg-nebula-900 border border-nebula-800 rounded-xl p-3 flex items-center gap-3 overflow-x-auto hide-scrollbar shrink-0">
+                                <span className="text-xs font-bold text-nebula-400 uppercase tracking-wide shrink-0 px-2 flex items-center gap-1"><Server size={12}/> Sources:</span>
+                                {SERVERS.map(s => (
+                                    <button key={s.id} onClick={() => setActiveServerId(s.id)} className={`shrink-0 px-4 py-2 rounded-lg text-sm font-bold transition-all ${activeServerId === s.id ? 'bg-nebula-600 text-white shadow-[0_0_10px_rgba(126,34,206,0.5)]' : 'bg-nebula-950 text-nebula-300 hover:bg-nebula-800 border border-nebula-800'}`}>
+                                        {s.name}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Views ---
+        const HomeView = () => {
+            const ROW_CONFIGS = [
+                { title: 'Trending Today', url: '/trending/all/day' },
+                { title: 'Blockbuster Movies', url: '/movie/popular' },
+                { title: 'Binge-Worthy TV', url: '/tv/popular' },
+                { title: 'Sci-Fi & Fantasy', url: '/discover/movie?with_genres=878,14' }
+            ];
+
+            return (
+                <div className="pb-24 animate-in fade-in duration-500">
+                    <HeroBanner endpoint="/trending/all/day" />
+                    <div className="mt-[-60px] relative z-10">
+                        {ROW_CONFIGS.map(row => <MediaRow key={row.title} title={row.title} url={row.url} />)}
+                    </div>
+                </div>
+            );
+        };
+
+        const DownloadsView = () => {
+            const { downloadedMedia, removeDownload, openDetails } = React.useContext(AppContext);
+
+            return (
+                <div className="pt-12 pb-24 px-6 max-w-5xl mx-auto min-h-screen animate-in fade-in">
+                    <div className="flex items-center gap-3 mb-8">
+                        <div className="bg-nebula-800 p-3 rounded-xl shadow-[0_0_15px_rgba(126,34,206,0.3)] border border-nebula-600">
+                            <Download size={24} className="text-nebula-400" />
+                        </div>
+                        <div>
+                            <h1 className="text-2xl font-extrabold text-white">Local Library</h1>
+                            <p className="text-sm text-nebula-300">Available for offline viewing</p>
+                        </div>
+                    </div>
+
+                    {downloadedMedia.length === 0 ? (
+                        <div className="bg-nebula-900 border border-nebula-800 rounded-2xl p-12 text-center shadow-lg">
+                            <DownloadCloud size={48} className="text-nebula-700 mx-auto mb-4" />
+                            <h3 className="text-xl font-bold text-white mb-2">No Downloads Yet</h3>
+                            <p className="text-nebula-400 text-sm">Movies and shows you download will appear here.</p>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+                            {downloadedMedia.map(item => (
+                                <div key={item.id} className="relative group">
+                                    <div onClick={() => openDetails(item)} className="cursor-pointer transition-all duration-300 hover:scale-105 rounded-xl border border-nebula-700 overflow-hidden shadow-lg bg-nebula-900">
+                                        <img src={item.Poster} className="w-full aspect-[2/3] object-cover" />
+                                        <div className="p-3">
+                                            <h4 className="text-sm font-bold text-white line-clamp-1">{item.Title}</h4>
+                                            <p className="text-[10px] text-nebula-400 mt-1 uppercase font-bold">{item.Type}</p>
+                                        </div>
+                                    </div>
+                                    <button onClick={(e) => { e.stopPropagation(); removeDownload(item.id); }} className="absolute -top-2 -right-2 bg-red-600 hover:bg-red-500 text-white p-2 rounded-full shadow-lg opacity-0 group-hover:opacity-100 transition-opacity z-10">
+                                        <Trash2 size={14} />
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const SettingsView = () => {
+            const { tmdbKey, setTmdbKey, clearData } = React.useContext(AppContext);
+
+            return (
+                <div className="pt-12 pb-24 px-6 max-w-2xl mx-auto min-h-screen animate-in fade-in">
+                    <h1 className="text-2xl font-extrabold text-white mb-8 flex items-center gap-3"><Settings size={28} className="text-nebula-500"/> Platform Settings</h1>
+
+                    <div className="space-y-6">
+                        <div className="card-gradient p-6 rounded-2xl border border-nebula-800 shadow-[0_10px_30px_rgba(0,0,0,0.5)]">
+                            <h2 className="text-lg font-bold text-white mb-4 flex items-center gap-2"><ShieldCheck size={20} className="text-nebula-400"/> Encrypted IPTV Vault</h2>
+                            <p className="text-xs text-nebula-300 leading-relaxed">The IPTV Vault is securely locked and pre-configured with premium access credentials. No further configuration is required.</p>
+                            <div className="mt-4 bg-nebula-950 border border-nebula-800 px-4 py-3 rounded-xl text-sm text-gray-500 flex items-center justify-between">
+                                <span>Status</span>
+                                <span className="text-green-400 font-bold flex items-center gap-1"><CheckCircle2 size={16}/> Connected</span>
+                            </div>
+                        </div>
+
+                        <div className="card-gradient p-6 rounded-2xl border border-nebula-800">
+                            <h2 className="text-lg font-bold text-white mb-4 flex items-center gap-2"><Database size={20} className="text-nebula-400"/> System Data</h2>
+                            <label className="block text-xs font-bold text-nebula-400 mb-1 uppercase tracking-wider">TMDB API Key</label>
+                            <input type="text" value={tmdbKey} onChange={e => setTmdbKey(e.target.value)} className="w-full bg-nebula-950 border border-nebula-800 focus:border-nebula-500 px-4 py-3 rounded-xl outline-none text-sm transition-colors text-white mb-6" />
+                            
+                            <button onClick={clearData} className="w-full bg-red-900/30 hover:bg-red-900/50 text-red-400 border border-red-500/30 py-3 rounded-xl font-bold transition-colors flex justify-center items-center gap-2">
+                                <Trash2 size={18}/> Reset Application Data
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Main App Logic ---
+        function App() {
+            // Environment State
+            const [isOffline, setIsOffline] = useState(!navigator.onLine);
+
+            // Settings State
+            const [tmdbKey, setTmdbKey] = useState(() => localStorage.getItem('ns_tmdb') || '15d2ea6d0dc1d476efbca3eba2b9bbfb');
+
+            // Media State
+            const [downloadedMedia, setDownloadedMedia] = useState([]);
+            const [activeTab, setActiveTab] = useState('home');
+            const [selectedMedia, setSelectedMedia] = useState(null);
+            const [activePlayerMedia, setActivePlayerMedia] = useState(null);
+
+            // Network Listeners
+            useEffect(() => {
+                const handleOnline = () => { setIsOffline(false); if (activeTab === 'downloads') setActiveTab('home'); };
+                const handleOffline = () => { setIsOffline(true); setActiveTab('downloads'); };
+                window.addEventListener('online', handleOnline);
+                window.addEventListener('offline', handleOffline);
+                if (isOffline) setActiveTab('downloads');
+                return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
+            }, []);
+
+            // Storage Persist
+            useEffect(() => localStorage.setItem('ns_tmdb', tmdbKey), [tmdbKey]);
+
+            // DB Load
+            useEffect(() => {
+                LocalDB.getDownloads().then(data => setDownloadedMedia(data || []));
+            }, []);
+
+            // Handlers
+            const downloadMedia = async (media) => {
+                await LocalDB.saveDownload(media);
+                const updated = await LocalDB.getDownloads();
+                setDownloadedMedia(updated);
+            };
+
+            const removeDownload = async (id) => {
+                await LocalDB.removeDownload(id);
+                const updated = await LocalDB.getDownloads();
+                setDownloadedMedia(updated);
+            };
+
+            const clearData = () => {
+                if(confirm("Are you sure you want to wipe all local data including downloaded metadata?")) {
+                    localStorage.clear();
+                    indexedDB.deleteDatabase(LocalDB.dbName);
+                    window.location.reload();
+                }
+            };
+
+            const contextValue = {
+                tmdbKey, setTmdbKey, isOffline, downloadedMedia, downloadMedia, removeDownload,
+                activePlayerMedia, setActivePlayerMedia, openDetails: setSelectedMedia, launchPlayer: (item, s, e, full) => {
+                    setActivePlayerMedia({ tmdbId: item.id, type: item.Type || 'movie', season: s, episode: e, title: item.title || item.name || item.Title });
+                    setSelectedMedia(null);
+                }, clearData
+            };
+
+            return (
+                <AppContext.Provider value={contextValue}>
+                    <div className="relative w-full min-h-screen bg-nebula-900 selection:bg-nebula-500 selection:text-white">
+                        {/* Top Network Indicator */}
+                        {isOffline && (
+                            <div className="fixed top-0 left-0 right-0 z-50 bg-amber-600 text-white text-xs font-bold text-center py-1.5 shadow-lg flex items-center justify-center gap-2">
+                                <WifiOff size={14} /> Offline Mode: Viewing Local Library
+                            </div>
+                        )}
+
+                        {/* Routing */}
+                        <div className={isOffline ? "pt-6" : ""}>
+                            {activeTab === 'home' && !isOffline && <HomeView />}
+                            {activeTab === 'downloads' && <DownloadsView />}
+                            {activeTab === 'settings' && !isOffline && <SettingsView />}
+                        </div>
+
+                        {/* Modals & Overlays */}
+                        {selectedMedia && <DetailsModal media={selectedMedia} onClose={() => setSelectedMedia(null)} />}
+                        {activePlayerMedia && <PlayerOverlay />}
+
+                        {/* Bottom Navigation */}
+                        <div className="fixed bottom-0 left-0 right-0 bg-nebula-900/90 backdrop-blur-xl border-t border-nebula-800 px-6 py-4 z-40 shadow-[0_-10px_30px_rgba(0,0,0,0.5)] pb-safe">
+                            <div className="max-w-md mx-auto flex justify-around items-center">
+                                <button onClick={() => !isOffline && setActiveTab('home')} disabled={isOffline} className={`flex flex-col items-center gap-1.5 transition-all duration-300 ${activeTab === 'home' ? 'text-nebula-400 scale-110 drop-shadow-[0_0_8px_rgba(168,85,247,0.8)]' : isOffline ? 'text-nebula-800 cursor-not-allowed' : 'text-nebula-600 hover:text-nebula-500'}`}>
+                                    <Home size={24} className={activeTab === 'home' ? 'fill-nebula-400/20' : ''} />
+                                </button>
+                                <button onClick={() => setActiveTab('downloads')} className={`flex flex-col items-center gap-1.5 transition-all duration-300 ${activeTab === 'downloads' ? 'text-nebula-400 scale-110 drop-shadow-[0_0_8px_rgba(168,85,247,0.8)]' : 'text-nebula-600 hover:text-nebula-500'}`}>
+                                    <Download size={24} className={activeTab === 'downloads' ? 'fill-nebula-400/20' : ''} />
+                                </button>
+                                <button onClick={() => !isOffline && setActiveTab('settings')} disabled={isOffline} className={`flex flex-col items-center gap-1.5 transition-all duration-300 ${activeTab === 'settings' ? 'text-nebula-400 scale-110 drop-shadow-[0_0_8px_rgba(168,85,247,0.8)]' : isOffline ? 'text-nebula-800 cursor-not-allowed' : 'text-nebula-600 hover:text-nebula-500'}`}>
+                                    <Settings size={24} className={activeTab === 'settings' ? 'fill-nebula-400/20' : ''} />
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </AppContext.Provider>
+            );
+        }
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
